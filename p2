@@ -1,0 +1,199 @@
+分析内核中cfs调度器相关代码。
+1、	CFS概述：
+CFS 背后的主要想法是维护为任务提供处理器时间方面的平衡（公平性）。它从RSDL/SD中吸取了完全公平的思想，不再跟踪进程的睡眠时间,
+也不再企图区分交互式进程。它将所有的进程都统一对待。按照作者Ingo Molnar的说法："CFS百分之八十的工作可以用一句话概括：CFS在
+真实的硬件上模拟了完全理想的多任务处理器"。在“完全理想的多任务处理器 “下，每个进程都能同时获得CPU的执行时间。
+当系统中有两个进程时，CPU的计算时间被分成两份，每个进程获得50%。
+2、	算法：
+CFS调度算法的核心是选择具有最小vruntine的任务。运行队列采用红黑树方式存放，其中节点的键值便是可运行进程的虚拟运行时间。
+CFS调度器选取待运行的下一个进程，是所有进程中vruntime最小的那个，他对应的便是在树中最左侧的叶子节点。
+3、	分析
+  /*  
+ * Share the fairness runtime between parent and child, thus the  
+ * total amount of pressure for CPU stays equal - new tasks  
+ * get a chance to run but frequent forkers are not allowed to  
+ * monopolize the CPU. Note: the parent runqueue is locked,  
+ * the child is not running yet.  
+ */   
+static  void  task_new_fair(struct  rq *rq, struct  task_struct *p)  
+{  
+ struct  cfs_rq *cfs_rq = task_cfs_rq(p);  
+  struct  sched_entity *se = &p->se, *curr = cfs_rq->curr;  
+ int  this_cpu = smp_processor_id();  
+  sched_info_queued(p);  
+  update_curr(cfs_rq);  
+  place_entity(cfs_rq, se, 1);  
+  /* 'curr' will be NULL if the child belongs to a different group */   
+ if  (sysctl_sched_child_runs_first && this_cpu == task_cpu(p) &&  
+ curr && curr->vruntime < se->vruntime) {  
+/*  
+ * Upon rescheduling, sched_class::put_prev_task() will place  
+  * 'current' within the tree based on its new key value.  
+  */   
+ swap(curr->vruntime, se->vruntime);  
+  resched_task(rq->curr);  
+  }  
+  enqueue_task_fair(rq, p, 0);  
+} 
+有两个重要的函数，update_curr，place_entity。 其中update_curr是更新进程的一些随时间变化的信息，place_entity是更新新进程的vruntime值，以便把他插入红黑树。
+更新进程变化信息相关函数：
+static void update_curr(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 now = rq_of(cfs_rq)->clock;/*now计时器*/
+	unsigned long delta_exec;
+
+	if (unlikely(!curr))
+	return;
+
+	/*
+	 * Get the amount of time the current task was running
+	 * since the last time we changed load (this cannot
+	 * overflow on 32 bits):
+	 */
+	 /*获得从最后一次修改负载后当前任务所占用的运行总时间*/
+	/*即计算当前进程的执行时间*/
+	delta_exec = (unsigned long)(now - curr->exec_start);
+	if (!delta_exec)/*如果本次没有执行过，不用重新更新了*/
+	return;
+	/*根据当前可运行进程总数对运行时间进行加权计算*/
+	__update_curr(cfs_rq, curr, delta_exec);
+	curr->exec_start = now;/*将exec_start属性置为now*/
+
+	if (entity_is_task(curr)) {/*下面为关于组调度的
+	struct task_struct *curtask = task_of(curr);
+
+	trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
+	cpuacct_charge(curtask, delta_exec);
+	account_group_exec_runtime(curtask, delta_exec);
+	}
+}
+static inline void
+__update_curr(struct cfs_rq *cfs_rq, struct sched_entity *curr,
+	      unsigned long delta_exec)
+{
+	unsigned long delta_exec_weighted;
+
+	schedstat_set(curr->exec_max, max((u64)delta_exec, curr->exec_max));
+	/*总运行时间更新*/
+	curr->sum_exec_runtime += delta_exec;
+	/*更新cfs_rq的exec_clock*/
+	schedstat_add(cfs_rq, exec_clock, delta_exec);
+	/*用优先级和delta_exec来计算weighted以用于更细vruntime*/
+	delta_exec_weighted = calc_delta_fair(delta_exec, curr);
+	/*vruntime可以准确地测量给定进程的运行时间
+	而且可知道谁应该是下一个被运行的进程*/
+
+	/*更新进程的vruntime*/
+	curr->vruntime += delta_exec_weighted;
+	update_min_vruntime(cfs_rq);
+}
+
+Place_entity函数如下：
+static void
+ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ {
+ u64 vruntime;
+
+ vruntime = cfs_rq->min_vruntime;
+
+ ...
+ if (initial && sched_feat(START_DEBIT))
+ vruntime += sched_vslice_add(cfs_rq, se);
+ 
+  if (!initial) {
+ /* sleeps upto a single latency don't count. */
+ if (sched_feat(NEW_FAIR_SLEEPERS) && entity_is_task(se))
+ vruntime -= sysctl_sched_latency;
+
+/* ensure we never gain time by being placed backwards. */
+  vruntime = max_vruntime(se->vruntime, vruntime);
+ }
+ ...
+  se->vruntime = vruntime;
+  }
+enqueue_task_fair调用place_entity传递的initial参数为0，所以会执行if (!initial)后的语句。因为进程睡眠后，vruntime就不会增加了，当它醒来后不知道过了多长时间，可能vruntime已经比 min_vruntime小了很多，如果只是简单的将其插入到就绪队列中，它将拼命追赶min_vruntime，因为它总是在红黑树的最左面。如果这 样，它将会占用大量的CPU时间，导致红黑树右边的进程被饿死。但是我们又必须及时响应醒来的进程，因为它们可能有一些工作需要立刻处理，所以系统采取了 一种折衷的办法，将当前cfs_rq->min_vruntime时间减去sysctl_sched_latency赋给vruntime，这时它 会被插入到就绪队列的最左边。这样刚唤醒的进程在当前执行进程时间耗尽时就会被调度上处理器执行。当然如果进程没有睡眠那么多时间，我们只需保留原来的时 间vruntime = max_vruntime(se->vruntime, vruntime)。
+static void entity_tick(struct cfs_rq * cfs_rq，struct sched _entity * curr)
+{
+	struct sched_entity* next;
+	dequeue_entity(cfs_rq，curr，0);
+	enqueue_entity(cfs_rq，curr，0);
+	next = __pick_next_entity(cfs_rq);
+	if (next == curr)
+	return;
+	__check_preempt_curr_fair(cfs_rq，next，curr，sched_granularity(cfs_rq));
+}
+通过调用dequeue_entity()和enqueue_entity()，将任务从红黑树中删除再插入来调整任务在红黑树中的位置。_pick_next_entity()返回红黑树中最左边的叶子节点，如果此节点不是当前任务，就调用_check_preempt_curr_fair()设置调度标志，当中断返回时就会调用schedule_tick()进行调度，替换当前任务。
+对于从运行队列中删除函数dequeue_task_fair
+/*
+ * The dequeue_task method is called before nr_running is
+ * decreased. We remove the task from the rbtree and
+ * update the fair scheduling stats:
+ */
+static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int sleep)
+{
+	struct cfs_rq *cfs_rq;
+	struct sched_entity *se = &p->se;
+
+	for_each_sched_entity(se) {/*考虑了组调度*/
+	  cfs_rq = cfs_rq_of(se);/*获得se对应的运行队列*/
+	  dequeue_entity(cfs_rq, se, sleep);
+	/* Don't dequeue parent if it has other entities besides us */
+	  if (cfs_rq->load.weight)
+  break;
+  	sleep = 1;
+	}
+	/*更新hrtick*/
+	hrtick_update(rq);
+}
+/*删除动作发生在进程阻塞(变为不可运行状态)
+或者终止时(结束运行)*/
+static void
+dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int sleep)
+{
+	/*
+	 * Update run-time statistics of the 'current'.
+	 */
+	update_curr(cfs_rq);
+
+	update_stats_dequeue(cfs_rq, se);
+	if (sleep) {
+#ifdef CONFIG_SCHEDSTATS
+ 	if (entity_is_task(se)) {
+  	struct task_struct *tsk = task_of(se);
+
+ 	 if (tsk->state & TASK_INTERRUPTIBLE)
+	 se->sleep_start = rq_of(cfs_rq)->clock;
+	 if (tsk->state & TASK_UNINTERRUPTIBLE)
+	 se->block_start = rq_of(cfs_rq)->clock;
+	}
+#endif
+	}
+
+	clear_buddies(cfs_rq, se);
+
+	if (se != cfs_rq->curr)
+  	__dequeue_entity(cfs_rq, se);
+	account_entity_dequeue(cfs_rq, se);
+	update_min_vruntime(cfs_rq);
+}
+static inline unsigned long
+calc_delta_fair(unsigned long delta, struct sched_entity *se)
+{
+ 	/*NICE_0_LOAD: 优先级0 的weight*/ 
+  	 /* 如果不是优先级0,就要调用calc_delta_mine计算delta的weight值*/ 
+	if (unlikely(se->load.weight != NICE_0_LOAD))
+  	delta = calc_delta_mine(delta, NICE_0_LOAD, &se->load);
+
+	return delta;
+}
+从这个函数中可以看到,如果进程的优先级为0,那么就是返回delta.
+如果不为0,就会调用calc_delta_mine()对delta值进行修正.对上面对calc_delta_mine()的说明来看
+,有如下关系: Delta = delta* NICE_0_LOAD/ se->load。跟踪sys_nice(),就可以发现se->load
+其它就是表示nice对应的load值,nice越低,值越大. 
+据此,就可以得到一个结论.在执行相同时间的条件下(delta相同),
+高优先的进程计算出来的delta值会比低优先级的进程计算出来
+的低.应此,高优先的进程就会位于rb_tree的左边,在下次调度的
+时候就会优先调度. 
+
+删除函数最终将由__dequeue_entity()函数从红黑树里面删除
